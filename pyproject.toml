@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "devagent"
+version = "0.1.0"
+description = "只有一个 bash 工具、能自举的极简命令行 AI Agent"
+requires-python = ">=3.10"
+dependencies = ["openai>=1.40", "anthropic>=0.40", "prompt_toolkit>=3.0", "rich>=13"]
+
+[project.scripts]
+devagent = "devagent.cli:main"
+
+[tool.setuptools]
+packages = ["devagent", "devagent.extensions"]
