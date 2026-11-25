@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 from devagent import ui
-from devagent.agent import Agent
+from devagent.agent import MAX_STEPS, Agent
 from devagent.commands import run_command
 from devagent.config import HOME_DIR, load_config
 
@@ -34,6 +34,8 @@ def main():
     agent.load_extensions()
     agent.emit("session_start")
 
+    if len(sys.argv) > 1 or not sys.stdin.isatty():
+        agent.max_steps = MAX_STEPS  # 无人值守：没人按 Ctrl+C，要有步数上限
     if len(sys.argv) > 1:
         run_one(agent, " ".join(sys.argv[1:]))
         return

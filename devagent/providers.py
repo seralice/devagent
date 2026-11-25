@@ -6,7 +6,8 @@
     {"role": "tool", "tool_call_id": "...", "content": "..."}
 工具定义也用内部格式：{"name": ..., "description": ..., "parameters": JSON Schema}。
 
-每个 Provider 只有一个方法 complete(system, messages, tools)，返回一条内部格式的 assistant 消息。
+每个 Provider 只有一个方法 complete(system, messages, tools, allow_tools=True)，返回一条内部格式的 assistant 消息。
+allow_tools=False 时工具定义照常发送（请求前缀不变，缓存能命中），但用 tool_choice 禁止模型调用。
 usage 统一成 4 个数：input（本次请求的全部输入，含缓存部分）、output、cache_read（命中缓存）、cache_write（写入缓存）。
 """
 import json
@@ -74,7 +75,7 @@ class ChatProvider:
         from openai import OpenAI
         self.client, self.model = OpenAI(base_url=base_url, api_key=api_key), model
 
-    def complete(self, system, messages, tools):
+    def complete(self, system, messages, tools, allow_tools=True):
         wire = [{"role": "system", "content": system}]
         for m in messages:
             if m["role"] == "assistant":
@@ -88,7 +89,8 @@ class ChatProvider:
                 wire.append({"role": "user", "content": to_chat_content(m["content"])})
         specs = [{"type": "function", "function": t} for t in tools]
 
-        resp = self.client.chat.completions.create(model=self.model, messages=wire, tools=specs)
+        resp = self.client.chat.completions.create(model=self.model, messages=wire, tools=specs,
+                                                   tool_choice="auto" if allow_tools else "none")
         reply, u = resp.choices[0].message, resp.usage
         usage = make_usage(u.prompt_tokens, u.completion_tokens,
                            getattr(u.prompt_tokens_details, "cached_tokens", 0)) if u else make_usage()
@@ -104,7 +106,7 @@ class ResponsesProvider:
         from openai import OpenAI
         self.client, self.model = OpenAI(base_url=base_url, api_key=api_key), model
 
-    def complete(self, system, messages, tools):
+    def complete(self, system, messages, tools, allow_tools=True):
         items = []
         for m in messages:
             if m["role"] == "assistant":
@@ -120,7 +122,8 @@ class ResponsesProvider:
         specs = [{"type": "function", **t} for t in tools]
 
         # store=False：不依赖服务端保存的会话，每轮都带完整历史，和另外两种协议保持一致
-        resp = self.client.responses.create(model=self.model, instructions=system, input=items, tools=specs, store=False)
+        resp = self.client.responses.create(model=self.model, instructions=system, input=items, tools=specs, store=False,
+                                            tool_choice="auto" if allow_tools else "none")
         u = resp.usage
         usage = make_usage(u.input_tokens, u.output_tokens,
                            getattr(u.input_tokens_details, "cached_tokens", 0)) if u else make_usage()
@@ -142,7 +145,7 @@ class AnthropicProvider:
         # 自动判断会在"新增内容比缓存还多"的那一步误判，所以由配置指定
         self.input_includes_cache = input_includes_cache
 
-    def complete(self, system, messages, tools):
+    def complete(self, system, messages, tools, allow_tools=True):
         wire = []
         for m in messages:
             if m["role"] == "assistant":
@@ -157,6 +160,9 @@ class AnthropicProvider:
                     wire[-1]["content"].append(block)
                 else:
                     wire.append({"role": "user", "content": [block]})
+            elif wire and wire[-1]["role"] == "user":
+                # 紧跟在工具结果后面的用户消息（比如步数用完时的总结指令）也合并进去，保持严格交替
+                wire[-1]["content"] += to_anthropic_content(m["content"])
             else:
                 wire.append({"role": "user", "content": to_anthropic_content(m["content"])})
         specs = [{"name": t["name"], "description": t["description"], "input_schema": t["parameters"]} for t in tools]
@@ -166,7 +172,8 @@ class AnthropicProvider:
         if wire:
             wire[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
 
-        resp = self.client.messages.create(model=self.model, system=system_blocks, messages=wire, tools=specs, max_tokens=8192)
+        resp = self.client.messages.create(model=self.model, system=system_blocks, messages=wire, tools=specs, max_tokens=8192,
+                                           tool_choice={"type": "auto" if allow_tools else "none"})
         u = resp.usage
         read, write = u.cache_read_input_tokens or 0, u.cache_creation_input_tokens or 0
         # 统一成 OpenAI 口径（input 含缓存部分），命中率才能都用 cache_read / input 算

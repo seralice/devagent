@@ -10,6 +10,7 @@
 """
 import base64
 import importlib.util
+import itertools
 import mimetypes
 import re
 import threading
@@ -57,8 +58,10 @@ def parse_user_content(task, cwd=None):
     return blocks
 
 
-MAX_STEPS = 90  # 防止模型陷入死循环；到了上限不直接停，让模型总结后交还给用户
-SUMMARY_PROMPT = f"""# 已达到本次任务的最大步数 {MAX_STEPS}
+# 步数上限只用于无人值守（单任务、管道输入）：交互模式下用户就是监督者，跑偏了按 Ctrl+C，不限步数（和 Claude Code 一样）。
+# 到了上限不直接停，让模型总结后交还给用户
+MAX_STEPS = 90
+SUMMARY_PROMPT = """# 已达到本次任务的最大步数 {max_steps}
 不要再调用任何工具。用文字向用户汇报：
 1. 已经完成了什么（改了哪些文件、验证结果如何）
 2. 还没完成什么，卡在哪里
@@ -96,6 +99,7 @@ class Agent:
         self.usage = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}  # 整个会话累计
         self.context_tokens = 0  # 最近一次请求的输入 + 输出，约等于当前上下文大小
         self.mcp = McpManager()
+        self.max_steps = None  # None 表示不限步数；无人值守的入口设成 MAX_STEPS（见 cli.py）
 
     def switch_model(self, api=None, model=None):
         """换协议或模型：只重建 provider。对话历史是内部格式，不用改。协议名不对时抛 ValueError，原配置不变。"""
@@ -138,10 +142,10 @@ class Agent:
         for k in usage:
             self.usage[k] += usage[k]
 
-    def call_model(self, system):
+    def call_model(self, system, allow_tools=True):
         tools = [BASH_TOOL, *self.mcp.get_tool_specs()]
         with ui.thinking():
-            reply = wait_interruptibly(self.provider.complete, system, self.messages, tools)
+            reply = wait_interruptibly(self.provider.complete, system, self.messages, tools, allow_tools)
         self.add_usage(reply["usage"])
         self.context_tokens = reply["usage"]["input"] + reply["usage"]["output"]
         return reply
@@ -154,7 +158,7 @@ class Agent:
         self.messages.append({"role": "user", "content": user_content})
 
         answer = None
-        for step in range(MAX_STEPS):
+        for step in itertools.count() if self.max_steps is None else range(self.max_steps):
             self.emit("turn_start", step)
             reply = self.call_model(system)
             self.messages.append(reply)
@@ -192,10 +196,13 @@ class Agent:
         return answer
 
     def summarize(self, system):
-        """步数用完时再调用一次模型，只要文字总结。说明放在 system 末尾而不是追加 user 消息，
-        避免和工具结果形成连续两条 user（部分网关要求严格交替）。"""
-        reply = self.call_model(system + "\n\n" + SUMMARY_PROMPT)
-        # 模型不听话仍然调用了工具：丢掉这些调用，否则历史里会留下没有结果的工具调用，下一轮请求被拒绝
+        """步数用完时再调用一次模型，只要文字总结（参考 Claude Code 的压缩请求）：
+        system 和工具定义都不变，请求前缀和上一步一样，缓存能命中；总结说明作为一条 user 消息追加在历史末尾；
+        工具定义照发，但用 tool_choice 禁止调用。之前把说明拼在 system 末尾、又允许调工具，
+        实测模型两次接着调 bash、文字为空，缓存也全部失效。"""
+        self.messages.append({"role": "user", "content": SUMMARY_PROMPT.format(max_steps=self.max_steps)})
+        reply = self.call_model(system, allow_tools=False)
+        # 个别网关不认 tool_choice，模型仍然调了工具：丢掉这些调用，否则历史里会留下没有结果的工具调用，下一轮请求被拒绝
         reply["tool_calls"] = []
         # 模型连总结也没给（返回空文字）：由程序兜底。兜底文字也写进历史，空的 assistant 消息下一轮可能被拒绝
         if not reply["text"]:
@@ -206,7 +213,7 @@ class Agent:
     def fallback_summary(self, n=5):
         """列出最后 n 个执行过的操作，至少让用户知道停在了哪里。"""
         calls = [c for m in self.messages if m["role"] == "assistant" for c in m["tool_calls"]][-n:]
-        lines = [f"已达到最大步数 {MAX_STEPS}，模型没有给出总结。最后执行的 {len(calls)} 个操作："]
+        lines = [f"已达到最大步数 {self.max_steps}，模型没有给出总结。最后执行的 {len(calls)} 个操作："]
         for c in calls:
             text = c["args"].get("command") or c["name"]
             lines.append("- " + " ".join(text.split())[:100])  # 多行命令压成一行，太长截断
