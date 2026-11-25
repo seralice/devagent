@@ -1,9 +1,10 @@
-"""系统提示词：身份 + 环境 + 已有工具 + 扩展写法 + 项目说明（AGENTS.md）。每个任务开始时重新生成，新写的工具马上可见。"""
+"""系统提示词：身份 + 环境 + 已有工具 + 扩展写法 + 技能清单 + 项目说明（AGENTS.md）。每个任务开始时重新生成，新写的工具马上可见。"""
 import platform
 from datetime import date
 
 from devagent.bash import BASH
 from devagent.config import HOME_DIR, search_dirs
+from devagent.skills import format_skills
 
 # AGENTS.md 是 Pi / Codex 的通用约定，CLAUDE.md 是 Claude Code 的。两个都认，同时存在时读靠前的
 INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md")
@@ -59,6 +60,11 @@ def build_system_prompt(cwd):
 - tool_result(output, call)：返回新的输出
 - agent_end(answer)""",
     ]
+
+    # 技能只放名字、描述和路径，正文由模型按需用 bash 读取
+    skills = format_skills(cwd)
+    if skills:
+        sections.append(skills)
 
     # 只看当前目录：上级目录的说明里可能有账号、密钥之类的规矩，不需要带进 Agent 的上下文
     for name in INSTRUCTION_FILES:

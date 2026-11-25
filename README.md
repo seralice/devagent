@@ -17,7 +17,8 @@ agent.py                agent loop + 事件总线 + 扩展加载 + 工具分发�
       ├── providers.py  内部消息格式 ↔ OpenAI Chat / OpenAI Responses / Anthropic Messages
       ├── bash.py       唯一的内置工具：Git Bash / bash，可中断，超时后结束整个进程树
       ├── mcp.py        零依赖的 MCP 客户端（JSON-RPC 2.0 over Stdio）
-      ├── prompt.py     系统提示词：环境、已有工具、扩展写法、当前目录的 AGENTS.md / CLAUDE.md
+      ├── prompt.py     系统提示词：环境、已有工具、技能清单、扩展写法、当前目录的 AGENTS.md / CLAUDE.md
+      ├── skills.py     读取 ~/.devagent/skills 和 .devagent/skills 下的 SKILL.md（只解析 frontmatter）
       └── extensions/   内置扩展：危险命令确认、长输出截断、上下文压缩
 ```
 
@@ -53,6 +54,22 @@ def register(agent):
 - `permission_gate`：危险命令（`rm -rf`、`sudo`、`git push` 等）先请用户确认，拒绝则拦截
 - `output_limit`：工具输出超过 4000 字符时截断
 - `compact`：上下文超过阈值时，总结较早的消息（保留最近几条原文，切点不落在工具结果上），原文存档到 `.devagent/history/`，摘要里写明存档路径
+
+### Skills（技能）
+
+一个 skill 是 `<目录>/<名字>/SKILL.md`：开头是 `---` 包起来的 frontmatter，至少有 `name` 和 `description`，后面是正文。全局的放 `~/.devagent/skills/`，项目的放当前目录的 `.devagent/skills/`，同名时项目的生效。
+
+```markdown
+---
+name: release
+description: 打版本号、改 CHANGELOG、发测试包
+---
+# 步骤
+1. 改 pyproject.toml 的 version
+...
+```
+
+系统提示词里只列每个 skill 的 name、description 和 SKILL.md 路径，正文不加载，模型判断任务和某个描述相符时再用 bash 读那个文件。格式不对（没有 frontmatter、缺 name / description）的文件跳过并打一行警告，不影响运行。
 
 ### MCP 客户端
 

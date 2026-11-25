@@ -57,7 +57,12 @@ def parse_user_content(task, cwd=None):
     return blocks
 
 
-MAX_STEPS = 30  # 防止模型陷入死循环
+MAX_STEPS = 90  # 防止模型陷入死循环；到了上限不直接停，让模型总结后交还给用户
+SUMMARY_PROMPT = f"""# 已达到本次任务的最大步数 {MAX_STEPS}
+不要再调用任何工具。用文字向用户汇报：
+1. 已经完成了什么（改了哪些文件、验证结果如何）
+2. 还没完成什么，卡在哪里
+3. 你建议的下一步，并询问用户是否继续或换个做法"""
 
 
 def wait_interruptibly(fn, *args):
@@ -148,7 +153,7 @@ class Agent:
         user_content = parse_user_content(task, self.cwd)
         self.messages.append({"role": "user", "content": user_content})
 
-        answer = f"超过最大步数 {MAX_STEPS}，已停止"
+        answer = None
         for step in range(MAX_STEPS):
             self.emit("turn_start", step)
             reply = self.call_model(system)
@@ -162,25 +167,51 @@ class Agent:
                 command = args.get("command", "")
                 ui.command(command if name == "bash" else f"{name} {args}")
                 reason = self.emit("tool_call", None, call=call)
-                if reason:
-                    output = f"已被拦截:{reason}"
-                elif name == "bash":
-                    if not command:
-                        output = "缺少command参数"
+                try:
+                    if reason:
+                        output = f"已被拦截:{reason}"
+                    elif name == "bash":
+                        if not command:
+                            output = "缺少command参数"
+                        else:
+                            output = run_bash(command,self.cwd)
+                    elif self.mcp.has_tool(name):
+                        output = self.mcp.call_tool(name, args)
                     else:
-                        output = run_bash(command,self.cwd)
-                elif self.mcp.has_tool(name):
-                    output = self.mcp.call_tool(name, args)
-                else:
-                    output = f"未知工具:{name}"
+                        output = f"未知工具:{name}"
+                except Exception as e:
+                    output = f"工具:{name},执行出错:{e!r},检查参数后重试!"
                 
                 output = self.emit("tool_result", output, call=call)
                 ui.output(output)
                 self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": output})
 
-
+        if answer is None:
+            answer = self.summarize(system)
         self.emit("agent_end", answer)
         return answer
+
+    def summarize(self, system):
+        """步数用完时再调用一次模型，只要文字总结。说明放在 system 末尾而不是追加 user 消息，
+        避免和工具结果形成连续两条 user（部分网关要求严格交替）。"""
+        reply = self.call_model(system + "\n\n" + SUMMARY_PROMPT)
+        # 模型不听话仍然调用了工具：丢掉这些调用，否则历史里会留下没有结果的工具调用，下一轮请求被拒绝
+        reply["tool_calls"] = []
+        # 模型连总结也没给（返回空文字）：由程序兜底。兜底文字也写进历史，空的 assistant 消息下一轮可能被拒绝
+        if not reply["text"]:
+            reply["text"] = self.fallback_summary()
+        self.messages.append(reply)
+        return reply["text"]
+
+    def fallback_summary(self, n=5):
+        """列出最后 n 个执行过的操作，至少让用户知道停在了哪里。"""
+        calls = [c for m in self.messages if m["role"] == "assistant" for c in m["tool_calls"]][-n:]
+        lines = [f"已达到最大步数 {MAX_STEPS}，模型没有给出总结。最后执行的 {len(calls)} 个操作："]
+        for c in calls:
+            text = c["args"].get("command") or c["name"]
+            lines.append("- " + " ".join(text.split())[:100])  # 多行命令压成一行，太长截断
+        lines.append("可以回复“继续”让它接着做，或者换个说法重新描述任务。")
+        return "\n".join(lines)
 
     def close_dangling_calls(self):
         """任务被 Ctrl+C 或报错打断时，给还没有结果的工具调用补一个结果，否则下一次请求会因为调用和结果对不上被拒绝。"""
