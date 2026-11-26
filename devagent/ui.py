@@ -3,6 +3,7 @@
 对话内容直接打印进终端自己的滚动区，不开全屏界面，所以鼠标滚轮、选中复制都由终端处理。
 交互模式下输入框由 repl.py 常驻在最底部，打印的内容会出现在它上方。
 """
+import threading
 import time
 
 from rich.console import Console, Group
@@ -90,14 +91,19 @@ def user(text):
     console.print(Gutter(Text(f" {text} ", TEXT), "┃ ", mark_style=PRIMARY, bg=BG_PANEL))
 
 
-def command(cmd):
+def _tag(label):
+    """子 Agent（swarm 的 worker / verifier）并行打印时，前面加个名字，分得清是谁。"""
+    return Text(f"[{label}] ", CYAN) if label else Text()
+
+
+def command(cmd, label=""):
     lines = cmd.splitlines() or [""]
     shown = "\n".join(lines[:MAX_COMMAND_LINES]) + (" …" if len(lines) > MAX_COMMAND_LINES else "")
     console.print()
-    console.print(Gutter(Text("$ ", MUTED) + Text(shown, TEXT), " " * INDENT))
+    console.print(Gutter(_tag(label) + Text("$ ", MUTED) + Text(shown, TEXT), " " * INDENT))
 
 
-def output(text):
+def output(text, label=""):
     # run_bash 的结果第一行是 exit=N；成功时不显示，失败时标红
     first, _, rest = text.partition("\n")
     head = Text()
@@ -107,7 +113,7 @@ def output(text):
         text = rest
     color = ORANGE if text.startswith("已拦截") else MUTED
     lines = text.rstrip("\n").splitlines() or ["（无输出）"]
-    body = head + Text("\n".join(lines[:MAX_LINES]), color)
+    body = head + _tag(label) + Text("\n".join(lines[:MAX_LINES]), color)
     if len(lines) > MAX_LINES:
         body.append(f"\n… 还有 {len(lines) - MAX_LINES} 行", f"italic {MUTED}")
     console.print(Gutter(body, " " * INDENT + "│ ", mark_style=BORDER_SUBTLE))
@@ -118,8 +124,8 @@ def answer(text):
     console.print(Gutter(AnswerMarkdown(text or "（模型没有给出文字回答）"), " " * INDENT))
 
 
-def info(text):
-    console.print(Text(" " * INDENT + text, CYAN))
+def info(text, label=""):
+    console.print(_tag(label) + Text(" " * INDENT + text, CYAN))
 
 
 def error(text):
@@ -134,11 +140,17 @@ def clear():
     console.clear()
 
 
+# 确认提示要独占终端：swarm 的多个 worker 可能同时命中危险命令，不加锁就会有两个提示抢同一行输入。
+# 扩展调 ui.confirm 时不用自己加锁，这里已经加好了
+CONFIRM_LOCK = threading.Lock()
+
+
 def confirm(question):
-    try:
-        return console.input(Text(f"\n{question} [y/N] ", f"bold {ORANGE}")).strip().lower() == "y"
-    except EOFError:
-        return False  # 输入是管道、已经读完时当作拒绝，不让整个任务报错
+    with CONFIRM_LOCK:
+        try:
+            return console.input(Text(f"\n{question} [y/N] ", f"bold {ORANGE}")).strip().lower() == "y"
+        except EOFError:
+            return False  # 输入是管道、已经读完时当作拒绝，不让整个任务报错
 
 
 class Elapsed:

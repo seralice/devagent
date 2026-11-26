@@ -15,9 +15,10 @@ import mimetypes
 import re
 import threading
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 
-from devagent import ui
+from devagent import plan, swarm, ui
 from devagent.bash import BASH_TOOL, run_bash
 from devagent.config import BUILTIN_EXTENSIONS, search_dirs
 from devagent.mcp import McpManager
@@ -100,6 +101,14 @@ class Agent:
         self.context_tokens = 0  # 最近一次请求的输入 + 输出，约等于当前上下文大小
         self.mcp = McpManager()
         self.max_steps = None  # None 表示不限步数；无人值守的入口设成 MAX_STEPS（见 cli.py）
+        # 运行时可开关的模式（/plan、/swarm），以及子 Agent（swarm 的 worker / verifier）用到的几项
+        self.plan_mode = False    # 计划模式：bash 只放行只读命令
+        self.swarm_mode = False   # swarm 模式：工具列表里多一个 swarm
+        self.is_worker = False    # 子 Agent：不能再调 swarm、不画转圈
+        self.no_hooks = False     # 子 Agent 不触发 before_agent_start，系统提示词由 system_extra 决定
+        self.label = ""           # 子 Agent 在自己打印的命令 / 输出前加的名字
+        self.system_extra = ""    # 追加到系统提示词末尾（子 Agent 的角色和任务说明）
+        self.cancel_event = None  # threading.Event，主 Agent 被中断时置位，子 Agent 看到就停
 
     def switch_model(self, api=None, model=None):
         """换协议或模型：只重建 provider。对话历史是内部格式，不用改。协议名不对时抛 ValueError，原配置不变。"""
@@ -142,23 +151,75 @@ class Agent:
         for k in usage:
             self.usage[k] += usage[k]
 
+    def check_cancel(self):
+        """主 Agent 按了 Ctrl+C 之后，子 Agent 在每个新步骤开始前看到就停，别再发请求、别再执行命令。"""
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            raise KeyboardInterrupt
+
+    def tool_specs(self):
+        """发给模型的工具列表。swarm 模式开着、且不是子 Agent 时多一个 swarm 工具；关掉就消失。"""
+        specs = [BASH_TOOL, *self.mcp.get_tool_specs()]
+        if self.swarm_mode and not self.is_worker:
+            specs.append(swarm.SWARM_TOOL)
+        return specs
+
+    def build_system(self):
+        """系统提示词 = 基础提示词 → before_agent_start 钩子 → 模式说明 → 子 Agent 的角色说明。
+        模式说明在钩子之后拼，这样扩展改提示词不会把模式说明冲掉。"""
+        system = build_system_prompt(self.cwd)
+        if not self.no_hooks:
+            system = self.emit("before_agent_start", system)
+        sections = []
+        if self.plan_mode:
+            sections.append(plan.PROMPT_SECTION)
+        if self.swarm_mode and not self.is_worker:
+            sections.append(swarm.PROMPT_SECTION)
+        if self.system_extra:
+            sections.append(self.system_extra)
+        return (chr(10) * 2).join([system, *sections]) if sections else system
+
     def call_model(self, system, allow_tools=True):
-        tools = [BASH_TOOL, *self.mcp.get_tool_specs()]
-        with ui.thinking():
+        tools = self.tool_specs()
+        # 子 Agent 并行跑时共用同一个终端，转圈会互相打架，所以只有主 Agent 画
+        with (nullcontext() if self.is_worker else ui.thinking()):
             reply = wait_interruptibly(self.provider.complete, system, self.messages, tools, allow_tools)
         self.add_usage(reply["usage"])
         self.context_tokens = reply["usage"]["input"] + reply["usage"]["output"]
         return reply
 
+    def dispatch(self, call):
+        """执行一个工具调用，返回要交给模型的工具结果文字。"""
+        name, args = call["name"], call["args"]
+        command = args.get("command", "")
+        if self.plan_mode and name == "bash":
+            # 计划模式的拦截放在钩子之前：这里已经判定过，就不必再让 permission_gate 之类的扩展去问用户
+            blocked = plan.violation(command)
+            if blocked:
+                return f"已被拦截:{blocked}"
+        reason = self.emit("tool_call", None, call=call)
+        if reason:
+            return f"已被拦截:{reason}"
+        if name == "bash":
+            if not command:
+                return "缺少command参数"
+            return run_bash(command, self.cwd)
+        if name == "swarm" and self.swarm_mode and not self.is_worker:
+            return swarm.run(self, args)
+        if self.mcp.has_tool(name):
+            return self.mcp.call_tool(name, args)
+        return f"未知工具:{name}"
+
     def run_task(self, task):
         """Agent loop：调用模型 → 执行它要的命令 → 把结果喂回去，直到模型不再调用工具。"""
-        self.load_extensions()
-        system = self.emit("before_agent_start", build_system_prompt(self.cwd))
+        if not self.is_worker:
+            self.load_extensions()  # 子 Agent 用自己的钩子副本（见 swarm.make_child），这里不再重载
+        system = self.build_system()
         user_content = parse_user_content(task, self.cwd)
         self.messages.append({"role": "user", "content": user_content})
 
         answer = None
         for step in itertools.count() if self.max_steps is None else range(self.max_steps):
+            self.check_cancel()  # 主 Agent 被 Ctrl+C 后，子 Agent 不再开始新的一步
             self.emit("turn_start", step)
             reply = self.call_model(system)
             self.messages.append(reply)
@@ -166,31 +227,19 @@ class Agent:
                 answer = reply["text"]
                 break
             for call in reply["tool_calls"]:
-                name = call["name"]
-                args = call["args"]
-                command = args.get("command", "")
-                ui.command(command if name == "bash" else f"{name} {args}")
-                reason = self.emit("tool_call", None, call=call)
+                name, args = call["name"], call["args"]
+                ui.command(args.get("command", "") if name == "bash" else f"{name} {args}", self.label)
                 try:
-                    if reason:
-                        output = f"已被拦截:{reason}"
-                    elif name == "bash":
-                        if not command:
-                            output = "缺少command参数"
-                        else:
-                            output = run_bash(command,self.cwd)
-                    elif self.mcp.has_tool(name):
-                        output = self.mcp.call_tool(name, args)
-                    else:
-                        output = f"未知工具:{name}"
+                    output = self.dispatch(call)
                 except Exception as e:
                     output = f"工具:{name},执行出错:{e!r},检查参数后重试!"
-                
+
                 output = self.emit("tool_result", output, call=call)
-                ui.output(output)
+                ui.output(output, self.label)
                 self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": output})
 
         if answer is None:
+            self.check_cancel()
             answer = self.summarize(system)
         self.emit("agent_end", answer)
         return answer

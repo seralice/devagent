@@ -51,6 +51,37 @@ def cmd_clear(agent, arg):
     ui.info("已清空对话历史")
 
 
+# 运行时开关：/plan、/swarm。不带参数时切换，on / off 显式设置
+
+def _toggle(arg):
+    """只认 on / off；不认识的写法返回 None。"""
+    return {"on": True, "off": False}.get(arg.strip().lower())
+
+
+def cmd_plan(agent, arg):
+    want = _toggle(arg) if arg else (not agent.plan_mode)
+    if want is None:
+        ui.error("用法：/plan on | /plan off（不带参数则切换）")
+        return
+    agent.plan_mode = want
+    if want:
+        ui.info("计划模式：已开启（只调研不改文件，bash 只放行只读命令）")
+    else:
+        ui.info("计划模式：已关闭（命令恢复正常执行）")
+
+
+def cmd_swarm(agent, arg):
+    want = _toggle(arg) if arg else (not agent.swarm_mode)
+    if want is None:
+        ui.error("用法：/swarm on | /swarm off（不带参数则切换）")
+        return
+    agent.swarm_mode = want
+    if want:
+        ui.info("Swarm 模式：已开启（模型可以调用 swarm 并行开多个子 Agent）")
+    else:
+        ui.info("Swarm 模式：已关闭（swarm 工具已从工具列表移除）")
+
+
 # 命令名 → (处理函数, 说明)
 COMMANDS = {
     "/help": (cmd_help, "显示所有命令"),
@@ -59,6 +90,8 @@ COMMANDS = {
     "/usage": (cmd_usage, "查看本次会话的 token 和缓存统计"),
     "/clear": (cmd_clear, "清空对话历史，开始新话题"),
     "/system": (cmd_system, "查看当前的系统提示词"),
+    "/plan": (cmd_plan, "计划模式开关：/plan on | /plan off，不带参数则切换"),
+    "/swarm": (cmd_swarm, "Swarm 模式开关：/swarm on | /swarm off，不带参数则切换"),
     "/exit": (cmd_exit, "退出"),
 }
 

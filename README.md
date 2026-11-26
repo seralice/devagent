@@ -19,7 +19,9 @@ agent.py                agent loop + 事件总线 + 扩展加载 + 工具分发�
       ├── mcp.py        零依赖的 MCP 客户端（JSON-RPC 2.0 over Stdio）
       ├── prompt.py     系统提示词：环境、已有工具、技能清单、扩展写法、当前目录的 AGENTS.md / CLAUDE.md
       ├── skills.py     读取 ~/.devagent/skills 和 .devagent/skills 下的 SKILL.md（只解析 frontmatter）
-      └── extensions/   内置扩展：危险命令确认、长输出截断、上下文压缩
+      ├── extensions/   内置扩展：危险命令确认、长输出截断、上下文压缩
+      ├── plan.py       计划模式的命令白名单检查
+      └── swarm.py      Swarm 模式：并行子 Agent + 共享看板
 ```
 
 ### 多协议适配
@@ -108,7 +110,28 @@ MCP Server 写在 `~/.devagent/config.json` 里（仓库自带一个示范 Serve
 }
 ```
 
-交互模式下的命令：`/help`、`/model`、`/api`、`/usage`、`/clear`、`/system`、`/exit`。
+交互模式下的命令：`/help`、`/model`、`/api`、`/usage`、`/clear`、`/system`、`/plan`、`/swarm`、`/exit`。
+
+### 计划模式
+
+`/plan on`、`/plan off`，只输入 `/plan` 则切换（`/swarm` 同理）。开启后系统提示词要求模型只调研、最后输出编号计划，
+`bash` 只放行只读命令（`ls`、`cat`、`grep`、`rg`、`find`、`git status / diff / log / show` 等），管道、`;`、`&&` 连接的每一段都要在白名单里；
+引号外的 `< > ( )`（重定向、进程替换、子 shell）、命令替换、`find -exec`、`rg --pre`、`git --ext-diff` 这类会写文件或执行外部程序的写法一律拦截。
+被拦的命令不执行，原因作为工具结果交给模型。
+
+> 白名单只用来防误操作，不是安全边界：shell 语法太多，真要隔离应该用沙箱（只读文件系统、禁网）。
+
+### Swarm 模式
+
+`/swarm on` 之后模型多一个 `swarm` 工具：`workers` 是 `[{name, brief}]` 数组（JSON 字符串也认），可选 `verifier`。
+每个 worker 是新建的 `Agent`，有自己的对话历史，并行运行，步数上限 30，拿不到 `swarm`（不能套娃）；全部结束后汇报拼成"共享看板"返回主 Agent，
+给了 `verifier` 再由它核对一遍。
+
+子 Agent 继承主 Agent 的约束：
+- 同样加载扩展，危险命令确认、输出截断、上下文压缩都生效；多个 worker 的确认提示加锁排队
+- 主 Agent 在计划模式时，worker 也只读
+- Ctrl+C 时置位 cancel 事件并打断所有 worker 线程，正在跑的命令一起杀掉；是否结束看每个 worker 自己置位的 `Event`，
+  不用 `Thread.is_alive()`（线程在 `join` 中被中断后它可能误报）
 
 ## License
 

@@ -71,6 +71,7 @@ class Repl:
     def __init__(self, agent, run_one):
         self.agent, self.run_one = agent, run_one
         self.worker = None          # 正在跑任务的后台线程
+        self.worker_done = None     # 上面那个线程结束时置位。判断忙不忙看它，不看 is_alive（原因见 start_task）
         self.busy_since = None      # 不为 None 时，状态行显示转圈和计时
         self.pending_ask = None     # 扩展在等用户回答 y/N 时：(Event, 存答案的 dict)
         self.last_ctrl_c = 0.0      # 上一次在空闲时按 Ctrl+C 的时间，用来判断"连按两次退出"
@@ -86,7 +87,7 @@ class Repl:
         ui.confirm = self.ask
 
     def busy(self):
-        return self.worker is not None and self.worker.is_alive()
+        return self.worker_done is not None and not self.worker_done.is_set()
 
     # ---------- 布局 ----------
 
@@ -204,14 +205,32 @@ class Repl:
                 ui.error(f"命令出错：{e!r}")
         else:
             ui.user(text)
-            self.worker = threading.Thread(target=self.run_one, args=(self.agent, text), daemon=True)
-            self.worker.start()
+            self.start_task(text)
         return False  # 清空输入框
+
+    def start_task(self, text):
+        """在后台线程里跑一个任务。结束标记用 Event 而不是 Thread.is_alive()：
+        这个线程是在 join(0.1)（见 agent.wait_interruptibly）里被 Ctrl+C 打断的，
+        CPython 的线程状态锁会留下错误结果，之后 is_alive() 可能对着还在跑的线程返回 False。"""
+        done = threading.Event()
+        self.worker_done = done
+
+        def target():
+            try:
+                self.run_one(self.agent, text)
+            finally:
+                done.set()
+
+        self.worker = threading.Thread(target=target, daemon=True)
+        self.worker.start()
 
     def interrupt(self):
         """往后台线程里抛 KeyboardInterrupt。它要等线程回到 Python 代码时才生效，
         所以模型请求、bash 命令、MCP 调用都改成了每 0.1 秒醒一次的等法（见 agent.wait_interruptibly）。"""
-        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(self.worker.ident), ctypes.py_object(KeyboardInterrupt))
+        ident = self.worker.ident if self.worker is not None else None
+        if ident is None:
+            return
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(ident), ctypes.py_object(KeyboardInterrupt))
         ui.info("正在中断…")
 
     # ---------- 给 ui 用的两个钩子（在后台线程里被调用） ----------
@@ -226,13 +245,22 @@ class Repl:
             self.app.invalidate()
 
     def ask(self, question):
-        """扩展（如危险命令确认）要用户回答 y/N：把问题打印出来，等用户在输入框里回答。"""
-        ui.console.print(Text(f"\n{' ' * ui.INDENT}{question} [y/N]", f"bold {ui.ORANGE}"))
-        done, box = threading.Event(), {}
-        self.pending_ask = (done, box)
-        self.app.invalidate()
-        done.wait()
-        return box["answer"]
+        """扩展（如危险命令确认）要用户回答 y/N：把问题打印出来，等用户在输入框里回答。
+        一次只问一个（ui.CONFIRM_LOCK）：swarm 的多个 worker 可能同时要确认，两个提示会抢同一行输入。
+        每 0.1 秒回一次 Python，Ctrl+C 塞进来的 KeyboardInterrupt 才能马上生效。"""
+        with ui.CONFIRM_LOCK:
+            ui.console.print(Text(f"\n{' ' * ui.INDENT}{question} [y/N]", f"bold {ui.ORANGE}"))
+            done, box = threading.Event(), {}
+            pending = (done, box)
+            self.pending_ask = pending
+            self.app.invalidate()
+            try:
+                while not done.wait(0.1):
+                    pass
+            finally:
+                if self.pending_ask is pending:
+                    self.pending_ask = None
+            return box.get("answer", False)
 
     def answer_ask(self, text):
         done, box = self.pending_ask
